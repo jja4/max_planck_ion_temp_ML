@@ -39,9 +39,9 @@ random.seed(123)
 # %% 
 GPU=True
 if GPU:
-    BATCH_SIZE = 200 # try 20, 50, 100, 64 seems to be max for GPU
-    num_epochs = 500
-    num_patience = 450
+    BATCH_SIZE = 32 # try 20, 50, 100, 64 seems to be max for GPU
+    num_epochs = 300
+    num_patience = 200
     steps = 10
     val_steps = 10
     num_schedule_reduce = int(10/steps)
@@ -51,7 +51,7 @@ if GPU:
     dropout_rate = 0.5
     activ_fun = 'relu' #leaky_relu
     regularizer =  None #tf.keras.regularizers.OrthogonalRegularizer() #needs tf 2.10 #l2(regularizer_pen), L1L2(regularizer_pen,regularizer_pen)
-    dense_regularizer = tf.keras.regularizers.OrthogonalRegularizer()
+    dense_regularizer = None #tf.keras.regularizers.OrthogonalRegularizer()
     kernel_size = (3,3) #3 originally
     stride = 1# (1,50) #(1,50) 
     pool_size = (2,2) #originally 2
@@ -59,7 +59,7 @@ if GPU:
     lr_patience = 2
     line_of_sight_start = 200
     cosine_importance = 1
-    k_division = 1 # how many fold to divide dataset, and use most recent one
+    k_division = 6 # how many fold to divide dataset, and use most recent one
     huber_delta = 0.2
     loss_fn = tf.keras.losses.Huber(delta = huber_delta)
     # def joint_loss(y_true, y_pred):
@@ -74,6 +74,9 @@ if GPU:
     rotation_factor = 4/360 # degrees of circle
     load_pretrained = False
     high_temp_sample_weight = 2 # 1/10 profiles have > 2 keV
+    Ensemble_Models = True
+    Test_Only = False
+    Ensemble_Simple_Average = False
 
 if GPU:
     physical_devices = tf.config.list_physical_devices('GPU')
@@ -304,14 +307,14 @@ def build_model(image_shape):
 
     model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
     #model.add(Dropout(0.25))
-    model.add(Conv2D(128, kernel_size=kernel_size, strides=stride, padding="same",\
+    model.add(Conv2D(64, kernel_size=kernel_size, strides=stride, padding="same",\
         kernel_initializer=weight_initializer,kernel_regularizer=regularizer))
     model.add(BatchNormalization(momentum=0.8))
     model.add(LeakyReLU(alpha=0.2))
     model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
     
     #model.add(Dropout(0.25))
-    model.add(Conv2D(256, kernel_size=kernel_size, strides=stride, padding="same",kernel_regularizer=regularizer))
+    model.add(Conv2D(32, kernel_size=kernel_size, strides=stride, padding="same",kernel_regularizer=regularizer))
     model.add(BatchNormalization(momentum=0.8))
     model.add(LeakyReLU(alpha=0.2))
     model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
@@ -323,8 +326,8 @@ def build_model(image_shape):
 
     #model.add(Dropout(0.25))
     model.add(Flatten())
-    model.add(Dense(256, activation='relu',kernel_regularizer=dense_regularizer))
-    model.add(BatchNormalization(momentum=0.8))
+    # model.add(Dense(256, activation='relu',kernel_regularizer=dense_regularizer))
+    #model.add(BatchNormalization(momentum=0.8))
     # model.add(Dense(100, activation='relu',kernel_regularizer=dense_regularizer))
     # model.add(BatchNormalization(momentum=0.8))
     # model.add(Dropout(0.25))
@@ -339,18 +342,68 @@ m.save(tmp_model_name)
 del m
 tf.keras.backend.clear_session()
 
+def load_all_models():
+    all_models = []
+    model_names = ['trained_model_huber.h5','trained_model_weighted_high_temp.h5', 'trained_model_32batch.h5']
+    for model_name in model_names:
+        filename = os.path.join(base_dir, model_name)
+        model = tf.keras.models.load_model(filename)
+        all_models.append(model)
+        print('loaded:', filename)
+    return all_models
 
+def ensemble_model(models,Ensemble_Simple_Average):
+    for i, model in enumerate(models):
+        model._name = f'{model._name}_{i}' 
+        for layer in model.layers:
+            layer.trainable = False
+    model_input = tf.keras.Input(shape=image_shape)
+    # ensemble_visible = [model.input for model in models]
+    
+    ensemble_outputs = [model(model_input) for model in models]
+    print(model(model_input).shape)
+    
+    if Ensemble_Simple_Average:
+        output = tf.keras.layers.Average()(ensemble_outputs)
+    else:
+        merge = tf.keras.layers.concatenate(ensemble_outputs, axis = 1)
+        ###### double check correct reshape dimensions
+        merge = tf.keras.layers.Reshape((output_arr.shape[1],len(models)))(merge) 
+        #merge = tf.keras.layers.Reshape((len(models),output_arr.shape[1],1))(merge) 
+        print(merge.shape)
+        #merge = tf.keras.layers.Permute((2,1,3))(merge)
+        print(merge.shape)
+        local_2d = tf.keras.layers.LocallyConnected1D(1,kernel_size=len(models),padding='same',implementation=2,activation = 'linear')(merge)
+        # local_2d = tf.keras.layers.LocallyConnected2D(1,kernel_size=(len(models),1),strides=(len(models),1),padding='same',implementation=2,activation = 'linear')(merge)
+        print(local_2d.shape)
+        output = tf.keras.layers.Flatten()(local_2d)
+        output = tf.keras.layers.Dense(40,activation = 'linear')(output)
+        print(output.shape)
+    model = tf.keras.models.Model(inputs=model_input, outputs=output)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate), loss=tf.keras.losses.Huber(huber_delta), metrics=[tf.keras.metrics.MeanSquaredError()],weighted_metrics=[])
+    return model
+
+if Ensemble_Models:
+    models = load_all_models()
+    model = ensemble_model(models,Ensemble_Simple_Average)
+
+
+if load_pretrained:
+    #saved_model = 'C:\\Users\\joaf\\Documents\\models\\trained_model_huber.h5'
+    model = tf.keras.models.load_model(MODEL_FNAME)
+    
 model.summary()
 
 """ Compile """
 
 
 #compile the model by determining loss function Binary Cross Entropy, optimizer as SGD
-model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate= learning_rate,), #Adam originally
-                loss= loss_fn, #joint_loss,
-                metrics=[tf.keras.metrics.MeanSquaredError()],
-                weighted_metrics=[],
-                sample_weight_mode=[None])
+if not Test_Only:
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate= learning_rate,), #Adam originally
+                    loss= loss_fn, #joint_loss,
+                    metrics=[tf.keras.metrics.MeanSquaredError()],
+                    weighted_metrics=[],
+                    sample_weight_mode=[None])
 
 #if validation accuracy doesnt improve for 15 epoch, stop training
 early_stopping = EarlyStopping(monitor='val_loss', patience=num_patience,restore_best_weights=True)
@@ -373,25 +426,21 @@ csv_logger = CSVLogger(base_dir+r'\log.csv', append=True, separator=' ')
 """ Train """
 fully_trained = False
 
-if load_pretrained:
-    model = tf.keras.models.load_model(MODEL_FNAME)#, custom_objects={'joint_loss': joint_loss})
 
-history=model.fit(train_dataset,
-    validation_data = valid_dataset,
-    steps_per_epoch = steps,
-    validation_steps = val_steps,
-    epochs = num_epochs,
-    verbose = 1,
-    callbacks = [checkpointer,csv_logger,early_stopping]) #reduce_lr,schedule_callback, tensorboard_callback
-fully_trained = True
+if not Test_Only:
+    history=model.fit(train_dataset,
+        validation_data = valid_dataset,
+        steps_per_epoch = steps,
+        validation_steps = val_steps,
+        epochs = num_epochs,
+        verbose = 1,
+        callbacks = [checkpointer,csv_logger,early_stopping]) #reduce_lr,schedule_callback, tensorboard_callback
+    fully_trained = True
 # %% 
 """ Plot the train and validation Loss """
-test_pretrained = True
-if test_pretrained:
-    saved_model = 'C:\\Users\\joaf\\Documents\\models\\trained_model_weighted_high_temp.h5'
-    model = tf.keras.models.load_model(saved_model)
 
-if not test_pretrained:
+
+if not Test_Only:
     if not fully_trained:
         history = model.history
     plt.plot(history.history['loss'][1:])
@@ -404,9 +453,29 @@ if not test_pretrained:
     plt.show(block=False)
 
 
-
+# %% 
 """ Evaluate on test data """
-scores = model.evaluate(test_dataset,steps=int(1000/BATCH_SIZE))
+# scores = model.evaluate(test_dataset,steps=int(1000/BATCH_SIZE))
+errors_1000 = np.zeros(BATCH_SIZE*int(1000/BATCH_SIZE))
+errors_per_rho_1000 = np.zeros((BATCH_SIZE*int(1000/BATCH_SIZE),output_arr.shape[1]))
+if Normalize_Output:
+    i =0
+    for images, (labels, sigmas), _ in test_dataset.take(int(1000/BATCH_SIZE)): 
+        truth = unnormalize_with_moments(labels, means_vars['total_output'][0],means_vars['total_output'][1])
+        pred = unnormalize_with_moments(model.predict(images), means_vars['total_output'][0],means_vars['total_output'][1])
+        errors_per_rho_1000[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = np.mean(np.square(truth - pred), axis=0)
+        errors_1000[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE)] = tf.keras.losses.mean_squared_error(truth, pred)
+        i+=1
+else: 
+    i =0
+    for images, (labels, sigmas), _ in test_dataset.take(int(1000/BATCH_SIZE)): 
+        truth = labels
+        pred = model.predict(images)
+        errors_per_rho_1000[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = np.mean(np.square(truth - pred), axis=0)
+        errors_1000[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE)] = tf.keras.losses.mean_squared_error(truth, pred)
+        i+=1
+    scores = errors_1000.mean()
+    
 print(scores)
 print("Plotting Examples")
 num_plots = 4
@@ -453,15 +522,12 @@ for images, (labels, sigmas), _ in test_dataset.take(num_plots):
     axs[i*ppp+p+1].set_ylabel('rho')
     axs[i*ppp+p+1].set_xlabel('line of sight')
     i+=1
-fig.suptitle(f'Overall MSE: {scores[1]:.4f}')
+fig.suptitle(f'Overall MSE: {scores:.4f}')
 fig.savefig(save_plots_dir+r"\predictions.png")
     
 
 plt.figure()
-if Normalize_Output:
-    plt.plot(rhos, np.mean(np.square(truth - pred), axis=0))
-else:
-    plt.plot(rhos, np.mean(np.square(labels - pred), axis=0))
+plt.plot(rhos, np.mean(errors_per_rho_1000, axis=0))
 plt.xlabel('rho')
 plt.ylabel('MSE keV')
 plt.title(f'Loss (MSE) at each rho [Raw Outputs]')
@@ -481,18 +547,22 @@ i = 0
 for images, (labels, sigmas), sample_weights in test_dataset.take(10): 
     intenstities = np.sum(images,axis=(1,2,3))
     intenstities_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE)] = intenstities
-    labels_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = labels
     sigmas_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = sigmas
     sample_weights_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE)] = sample_weights
     
     
-    pred = model.predict(images)
-    pred_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = pred
+    
     if Normalize_Output:
+        pred = unnormalize_with_moments(model.predict(images), means_vars['total_output'][0],means_vars['total_output'][1])
+        pred_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = pred
         truth = unnormalize_with_moments(labels, means_vars['total_output'][0],means_vars['total_output'][1])
+        labels_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = truth
         error = np.mean(np.square(truth - pred), axis=1)
         errors_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE)] = error
     else:
+        pred = model.predict(images)
+        pred_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = pred
+        labels_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = labels
         error = np.mean(np.square(labels - pred), axis=1)
         errors_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE)] = error
     #thresholded_idx = np.where(intenstities<0.1e9)[0]
@@ -501,20 +571,21 @@ for images, (labels, sigmas), sample_weights in test_dataset.take(10):
 
 plt.figure()
 plt.plot(rhos,labels_all[np.argmax(errors_all)], color = 'orange')
-plt.fill_between(rhos, labels_all[np.argmax(errors_all)] - sigmas_all[np.argmax(errors_all)], labels_all[np.argmax(errors_all)] + sigmas_all[np.argmax(errors_all)],
+if not Normalize_Output:
+    plt.fill_between(rhos, labels_all[np.argmax(errors_all)] - sigmas_all[np.argmax(errors_all)], labels_all[np.argmax(errors_all)] + sigmas_all[np.argmax(errors_all)],
                 color='gray', alpha=0.5)
 plt.plot(rhos,pred_all[np.argmax(errors_all)], color ='b')
 plt.xlabel('rho')
 plt.ylabel('MSE keV')
 plt.title(f'Worst Loss (MSE) of Batch: {errors_all[np.argmax(errors_all)]:.4f}')
 
-good_error_idx = np.where(errors_all<0.01)[0]
-error_per_rho = np.mean(np.square(np.array(labels_all)[good_error_idx] - np.array(pred_all)[good_error_idx]), axis=0)
+good_error_idx = np.where(errors_1000<0.001)[0]
+good_error_per_rho = np.mean(errors_per_rho_1000[good_error_idx,:], axis=0)
 plt.figure()
-plt.plot(rhos,error_per_rho)
+plt.plot(rhos,good_error_per_rho)
 plt.xlabel('rho')
 plt.ylabel('MSE keV')
-plt.title(f'Loss (MSE) at each rho [Good Outputs < 0.01 MSE]')
+plt.title(f'Loss (MSE) at each rho [Good Outputs < 0.001 MSE]')
 plt.savefig(save_plots_dir+r"\loss_per_rho_good_trials.png")
 plt.show(block=False)
 
@@ -555,11 +626,11 @@ plt.show(block=False)
 
 plt.figure()
 if Normalize_Output:
-    plt.plot(rhos, np.sqrt(np.mean(np.square(truth - pred), axis=0)), label = 'RMSE prediction')
+    plt.plot(rhos, np.sqrt(np.mean(errors_per_rho_1000, axis=0)), label = 'RMSE prediction')
 else:
     plt.plot(rhos, np.sqrt(np.mean(np.square(labels_all - pred_all), axis=0)), label = 'RMSE prediction')
 plt.plot(rhos, mean_sigmas, label= 'Sigma')
-plt.plot(rhos,np.sqrt(error_per_rho), label='RMSE good predictions')
+plt.plot(rhos,np.sqrt(good_error_per_rho), label='RMSE good predictions')
 plt.xlabel('rho')
 plt.ylabel('sigma from Novi keV')
 plt.title(f'Sigma at each rho [Raw Outputs]')
@@ -571,10 +642,16 @@ plt.show(block=False)
 plt.figure() # for scatter plot
 plt.axline([0, 0], [1, 1])
 for i in range(min(num_scatter,BATCH_SIZE)):
-    plt.scatter(model.predict(images)[i],labels[i],alpha=0.3)
+    if Normalize_Output:
+        pred = unnormalize_with_moments(model.predict(images)[i], means_vars['total_output'][0],means_vars['total_output'][1])
+        truth = unnormalize_with_moments(labels[i], means_vars['total_output'][0],means_vars['total_output'][1])
+        error = np.mean(np.square(truth - pred))
+        plt.scatter(pred,truth,alpha=0.3)
+    else:
+        plt.scatter(model.predict(images)[i],labels[i],alpha=0.3)
 plt.xlabel('Predicted keV')
 plt.ylabel('True keV')
-plt.suptitle(f'Scatter with Overall Loss: MSE (keV) {scores[1]:.4f}')
+plt.suptitle(f'Scatter with Overall Loss: MSE (keV) {errors_1000.mean():.4f}')
 plt.tight_layout()
 plt.savefig(save_plots_dir+r"\scatter.png")
 plt.show(block=False)
