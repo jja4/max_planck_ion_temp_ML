@@ -40,12 +40,13 @@ random.seed(123)
 GPU=True
 if GPU:
     BATCH_SIZE = 32 # try 20, 50, 100, 64 seems to be max for GPU
-    num_epochs = 300
-    num_patience = 200
+    num_epochs = 500
+    num_patience = 400
     steps = 10
     val_steps = 10
-    num_schedule_reduce = int(10/steps)
+    # num_schedule_reduce = int(10/steps)
     Normalize_Output = False
+    Normalize_Input_Global = False
     learning_rate = 0.01 #decent results with 0.0001
     regularizer_pen = 0.0001
     dropout_rate = 0.5
@@ -57,26 +58,30 @@ if GPU:
     pool_size = (2,2) #originally 2
     pool_stride = None #(1,50) #originally 2
     lr_patience = 2
+    wavelength_start =105
+    wavelength_end =185
     line_of_sight_start = 200
-    cosine_importance = 1
-    k_division = 6 # how many fold to divide dataset, and use most recent one
+    k_division = 1 # how many fold to divide dataset, and use most recent one
     huber_delta = 0.2
     loss_fn = tf.keras.losses.Huber(delta = huber_delta)
+    cosine_importance = 1
     # def joint_loss(y_true, y_pred):
     # return cosine_importance*tf.keras.losses.cosine_similarity(y_true, y_pred) + \
     #     tf.keras.losses.huber(y_true, y_pred, delta = huber_delta)
-    Augment = False
+    Augment = True
     intensity_threshold = 0.5e5
-    out_label_threshold = 5
-    out_sigma_threshold =  2.5
+    out_label_threshold = 2.5
+    out_sigma_threshold =  0.5
     height_factor = 4 # num of pixels
     width_factor = 8 # num of pixels
     rotation_factor = 4/360 # degrees of circle
     load_pretrained = False
-    high_temp_sample_weight = 2 # 1/10 profiles have > 2 keV
-    Ensemble_Models = True
+    high_temp_sample_weight = 1.5 # 1/10 profiles have > 2 keV
+    Ensemble_Models = False
     Test_Only = False
     Ensemble_Simple_Average = False
+    Locally_Connected = False
+    Inverse_Selection_of_Dataset = False
 
 if GPU:
     physical_devices = tf.config.list_physical_devices('GPU')
@@ -127,6 +132,13 @@ with h5py.File(hdf5_path, "r") as f:
     input_arr = f[train_input_key][:10]  # returns as a numpy array
     output_arr = f[train_output_key][:10]  # returns as a numpy array
     output_sigmas = f[train_output_sigma_key][:10] # tf.float32
+    
+    if Normalize_Input_Global:
+        mean_input, var_input = extract_mean_var(f[valid_input_key][:])
+        mean_input = tf.reshape(mean_input,[mean_input.shape[0],mean_input.shape[1],1])
+        var_input = tf.reshape(var_input,[var_input.shape[0],var_input.shape[1],1])
+        mean_input = tf.cast(mean_input, tf.float32)
+        var_input = tf.cast(var_input, tf.float32)
     mean_train, var_train = extract_mean_var(f[train_output_key][:])
     mean_valid, var_valid = extract_mean_var(f[valid_output_key][:])
     mean_test, var_test = extract_mean_var(f[test_output_key][:])
@@ -169,7 +181,7 @@ class generator:
                 #idx = random.randrange(hf[self.input_key].shape[0])
                 in_im = hf[self.input_key][-idx]
                 in_im = in_im.reshape(input_arr.shape[1],input_arr.shape[2],1) #shape of (195,1475,1)
-                in_im = in_im[:,line_of_sight_start:,:]
+                in_im = in_im[wavelength_start:wavelength_end,line_of_sight_start:,:]
                 
                 intenstity = np.sum(in_im)
         
@@ -179,7 +191,7 @@ class generator:
                 out_im_max = np.max(out_im)
                 out_sigma_max = np.max(out_sigma)
                 
-                if out_im_max>2:
+                if out_im_max>2 or out_im_max<1.52:
                     sample_weight = high_temp_sample_weight
                 else:
                     sample_weight = 1
@@ -188,11 +200,14 @@ class generator:
                     out_im = normalize_with_moments(out_im, means_vars['total_output'][0],means_vars['total_output'][1])
                 # out_im = normalize_with_moments(out_im, means_vars[self.output_key][0],means_vars[self.output_key][1])
             
-                
-                if intenstity>intensity_threshold and out_im_max<out_label_threshold and out_sigma_max<out_sigma_threshold: ### keeps 75% of images
-                    yield in_im, (out_im, out_sigma), sample_weight
+                if Inverse_Selection_of_Dataset:
+                    if intenstity<intensity_threshold or out_im_max>out_label_threshold or out_sigma_max>out_sigma_threshold: 
+                        yield in_im, (out_im, out_sigma), sample_weight
+                else:
+                    if intenstity>intensity_threshold and out_im_max<out_label_threshold and out_sigma_max<out_sigma_threshold: ### keeps 75% of images
+                        yield in_im, (out_im, out_sigma), sample_weight
 
-image_shape = (tf.TensorShape([input_arr.shape[1],input_arr.shape[2]-line_of_sight_start,1]))
+image_shape = (tf.TensorShape([wavelength_end-wavelength_start,input_arr.shape[2]-line_of_sight_start,1]))
 
 
 train_dataset = tf.data.Dataset.from_generator(
@@ -284,62 +299,73 @@ def build_model(image_shape):
         normed = tf.image.per_image_standardization(input)
         return normed
     model.add(Lambda(norm_image))
+    if Normalize_Input_Global:
+        def standardize_image_per_pixel(input):
+            mean, variance, epsilon = mean_input[wavelength_start:wavelength_end,line_of_sight_start:,:], var_input[wavelength_start:wavelength_end,line_of_sight_start:,:], 1e-8    
+            x_normed = (input - mean) / tf.sqrt(variance + epsilon) # epsilon to avoid dividing by zero
+            return x_normed
+        model.add(Lambda(standardize_image_per_pixel))
+    
     if Augment:
-        model.add(tf.keras.layers.RandomTranslation(height_factor=height_factor/input_arr.shape[1],
-            width_factor=width_factor/input_arr.shape[2],
+        model.add(tf.keras.layers.RandomTranslation(height_factor=height_factor/(wavelength_end-wavelength_start),
+            width_factor=width_factor/(input_arr.shape[2]-line_of_sight_start),
             fill_mode='nearest',
             interpolation='nearest'))
         model.add(tf.keras.layers.RandomRotation(
             factor=rotation_factor,
             fill_mode='nearest',
             interpolation='nearest'))
-    
-    model.add(Conv2D(64, kernel_size=kernel_size, strides=stride, input_shape=image_shape,
-                     padding="same",kernel_initializer=weight_initializer,kernel_regularizer=regularizer))
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
-    #model.add(Dropout(0.25))
-    model.add(Conv2D(64, kernel_size=kernel_size, strides=stride, padding="same",\
-        kernel_initializer=weight_initializer,kernel_regularizer=regularizer))
-    model.add(ZeroPadding2D(padding=((0,1),(0,1))))
-    model.add(BatchNormalization(momentum=0.8))
-    model.add(LeakyReLU(alpha=0.2))
+    if Locally_Connected:
+        model.add(tf.keras.layers.LocallyConnected2D(1,kernel_size=(80,int(1275/40)),strides=(80,int(1275/40)),padding='same',implementation=2,activation = 'relu'))
+        model.add(BatchNormalization(momentum=0.8))
+        model.add(Flatten())
+        model.add(Dense(output_arr.shape[1], activation="linear",kernel_regularizer=dense_regularizer))
+        return model
+    else:
+        model.add(Conv2D(64, kernel_size=kernel_size, strides=stride, input_shape=image_shape,
+                        padding="same",kernel_initializer=weight_initializer,kernel_regularizer=regularizer))
+        model.add(LeakyReLU(alpha=0.2))
+        model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
+        #model.add(Dropout(0.25))
+        model.add(Conv2D(64, kernel_size=kernel_size, strides=stride, padding="same",\
+            kernel_initializer=weight_initializer,kernel_regularizer=regularizer))
+        model.add(ZeroPadding2D(padding=((0,1),(0,1))))
+        model.add(BatchNormalization(momentum=0.8))
+        model.add(LeakyReLU(alpha=0.2))
 
-    model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
-    #model.add(Dropout(0.25))
-    model.add(Conv2D(64, kernel_size=kernel_size, strides=stride, padding="same",\
-        kernel_initializer=weight_initializer,kernel_regularizer=regularizer))
-    model.add(BatchNormalization(momentum=0.8))
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
-    
-    #model.add(Dropout(0.25))
-    model.add(Conv2D(32, kernel_size=kernel_size, strides=stride, padding="same",kernel_regularizer=regularizer))
-    model.add(BatchNormalization(momentum=0.8))
-    model.add(LeakyReLU(alpha=0.2))
-    model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
+        model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
+        #model.add(Dropout(0.25))
+        model.add(Conv2D(64, kernel_size=kernel_size, strides=stride, padding="same",\
+            kernel_initializer=weight_initializer,kernel_regularizer=regularizer))
+        model.add(BatchNormalization(momentum=0.8))
+        model.add(LeakyReLU(alpha=0.2))
+        model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
+        
+        #model.add(Dropout(0.25))
+        model.add(Conv2D(32, kernel_size=kernel_size, strides=stride, padding="same",kernel_regularizer=regularizer))
+        model.add(BatchNormalization(momentum=0.8))
+        model.add(LeakyReLU(alpha=0.2))
+        model.add(MaxPool2D(pool_size =pool_size, strides =pool_stride, padding ='same'))
 
-    # model.add(Dropout(0.25))
-    # model.add(Conv2D(512, kernel_size=3, strides=1, padding="same"))
-    # model.add(BatchNormalization(momentum=0.8))
-    # model.add(LeakyReLU(alpha=0.2))
+        # model.add(Dropout(0.25))
+        # model.add(Conv2D(512, kernel_size=3, strides=1, padding="same"))
+        # model.add(BatchNormalization(momentum=0.8))
+        # model.add(LeakyReLU(alpha=0.2))
 
-    #model.add(Dropout(0.25))
-    model.add(Flatten())
-    # model.add(Dense(256, activation='relu',kernel_regularizer=dense_regularizer))
-    #model.add(BatchNormalization(momentum=0.8))
-    # model.add(Dense(100, activation='relu',kernel_regularizer=dense_regularizer))
-    # model.add(BatchNormalization(momentum=0.8))
-    # model.add(Dropout(0.25))
-    model.add(Dense(output_arr.shape[1], activation="linear",kernel_regularizer=dense_regularizer))
+        #model.add(Dropout(0.25))
+        model.add(Flatten())
+        # model.add(Dense(256, activation='relu',kernel_regularizer=dense_regularizer))
+        #model.add(BatchNormalization(momentum=0.8))
+        # model.add(Dense(100, activation='relu',kernel_regularizer=dense_regularizer))
+        # model.add(BatchNormalization(momentum=0.8))
+        # model.add(Dropout(0.25))
+        model.add(Dense(output_arr.shape[1], activation="linear",kernel_regularizer=dense_regularizer))
 
-    return model
+        return model
 model = build_model(image_shape)
+model.summary()
 #%%
 # to be sure GPU memory is cleaned after last train
-m = model
-m.save(tmp_model_name)
-del m
 tf.keras.backend.clear_session()
 
 def load_all_models():
@@ -372,7 +398,6 @@ def ensemble_model(models,Ensemble_Simple_Average):
         #merge = tf.keras.layers.Reshape((len(models),output_arr.shape[1],1))(merge) 
         print(merge.shape)
         #merge = tf.keras.layers.Permute((2,1,3))(merge)
-        print(merge.shape)
         local_2d = tf.keras.layers.LocallyConnected1D(1,kernel_size=len(models),padding='same',implementation=2,activation = 'linear')(merge)
         # local_2d = tf.keras.layers.LocallyConnected2D(1,kernel_size=(len(models),1),strides=(len(models),1),padding='same',implementation=2,activation = 'linear')(merge)
         print(local_2d.shape)
@@ -424,8 +449,8 @@ csv_logger = CSVLogger(base_dir+r'\log.csv', append=True, separator=' ')
 
 # %% 
 """ Train """
+""" Train """
 fully_trained = False
-
 
 if not Test_Only:
     history=model.fit(train_dataset,
@@ -436,6 +461,7 @@ if not Test_Only:
         verbose = 1,
         callbacks = [checkpointer,csv_logger,early_stopping]) #reduce_lr,schedule_callback, tensorboard_callback
     fully_trained = True
+
 # %% 
 """ Plot the train and validation Loss """
 
@@ -519,20 +545,20 @@ for images, (labels, sigmas), _ in test_dataset.take(num_plots):
     
     axs[i*ppp+p+1].imshow(images[0,:,:,0])
     axs[i*ppp+p+1].set_title(f'Input Image')
-    axs[i*ppp+p+1].set_ylabel('rho')
+    axs[i*ppp+p+1].set_ylabel('wavelength')
     axs[i*ppp+p+1].set_xlabel('line of sight')
     i+=1
 fig.suptitle(f'Overall MSE: {scores:.4f}')
 fig.savefig(save_plots_dir+r"\predictions.png")
     
 
-plt.figure()
-plt.plot(rhos, np.mean(errors_per_rho_1000, axis=0))
-plt.xlabel('rho')
-plt.ylabel('MSE keV')
-plt.title(f'Loss (MSE) at each rho [Raw Outputs]')
-plt.savefig(save_plots_dir+r"\loss_per_rho.png")
-plt.show(block=False)
+# plt.figure()
+# plt.plot(rhos, np.mean(errors_per_rho_1000, axis=0))
+# plt.xlabel('rho')
+# plt.ylabel('MSE keV')
+# plt.title(f'Loss (MSE) at each rho [Raw Outputs]')
+# plt.savefig(save_plots_dir+r"\loss_per_rho.png")
+# plt.show(block=False)
 
 batches2take = 10
 intenstities_all = np.zeros(BATCH_SIZE*batches2take)
@@ -581,21 +607,24 @@ plt.title(f'Worst Loss (MSE) of Batch: {errors_all[np.argmax(errors_all)]:.4f}')
 
 good_error_idx = np.where(errors_1000<0.001)[0]
 good_error_per_rho = np.mean(errors_per_rho_1000[good_error_idx,:], axis=0)
-plt.figure()
-plt.plot(rhos,good_error_per_rho)
-plt.xlabel('rho')
-plt.ylabel('MSE keV')
-plt.title(f'Loss (MSE) at each rho [Good Outputs < 0.001 MSE]')
-plt.savefig(save_plots_dir+r"\loss_per_rho_good_trials.png")
-plt.show(block=False)
 
-h = sns.jointplot(x=intenstities_all[:], y=errors_all[:],ratio=2,kind='hist') #,marginal_kws=dict(bins=20)
-h.plot_joint(sns.kdeplot, color="r", zorder=0, levels=8)
+
+h = sns.jointplot(x=intenstities_all[:], y=errors_all[:],ratio=5,kind='hist') #,marginal_kws=dict(bins=20)
+# h.plot_joint(sns.kdeplot, color="r", zorder=0, levels=8)
 h.plot_marginals(sns.rugplot, color="r", height=-.1, clip_on=False)
 h.set_axis_labels('Intensity', 'MSE keV', fontsize=16)
 plt.suptitle(f'Loss (MSE) vs Intensity [Raw Outputs]')
 plt.tight_layout()
 plt.savefig(save_plots_dir+r"\loss_vs_intensity.png")
+plt.show(block=False)
+
+h = sns.jointplot(x=np.max(labels_all,axis=1), y=errors_all[:],ratio=5,kind='hist') #,marginal_kws=dict(bins=20)
+# h.plot_joint(sns.kdeplot, color="r", zorder=0, levels=8)
+h.plot_marginals(sns.rugplot, color="r", height=-.1, clip_on=False)
+h.set_axis_labels('Max Temp keV', 'MSE keV', fontsize=16)
+plt.suptitle(f'Loss (MSE) vs Max Temp [Raw Outputs]')
+plt.tight_layout()
+plt.savefig(save_plots_dir+r"\loss_vs_temp.png")
 plt.show(block=False)
     
 # find experiment number for corresponding bad profiles   
@@ -614,25 +643,22 @@ with h5py.File(hdf5_path, "r") as f:
     mean_sigmas = np.mean(f[test_output_sigma_key][:], axis=0)
     #print(sorted_max_sigmas[-60:])
 
-plt.figure()
-for i in range(len(max_labels)):
-    plt.plot(rhos,max_labels[i]) 
-    plt.fill_between(rhos, max_labels[i] - max_sigmas[i], max_labels[i] + max_sigmas[i],
-                    color='gray', alpha=0.5)
-plt.xlabel('rho')
-plt.ylabel('Ion Temp keV')
-plt.title(f'Worst Profiles [Raw Outputs]')
-plt.show(block=False)
+# plt.figure()
+# for i in range(len(max_labels)):
+#     plt.plot(rhos,max_labels[i]) 
+#     plt.fill_between(rhos, max_labels[i] - max_sigmas[i], max_labels[i] + max_sigmas[i],
+#                     color='gray', alpha=0.5)
+# plt.xlabel('rho')
+# plt.ylabel('Ion Temp keV')
+# plt.title(f'Worst Profiles [Raw Outputs]')
+# plt.show(block=False)
 
 plt.figure()
-if Normalize_Output:
-    plt.plot(rhos, np.sqrt(np.mean(errors_per_rho_1000, axis=0)), label = 'RMSE prediction')
-else:
-    plt.plot(rhos, np.sqrt(np.mean(np.square(labels_all - pred_all), axis=0)), label = 'RMSE prediction')
-plt.plot(rhos, mean_sigmas, label= 'Sigma')
-plt.plot(rhos,np.sqrt(good_error_per_rho), label='RMSE good predictions')
+plt.plot(rhos, mean_sigmas, label= 'Sigma', color='orange')
+plt.plot(rhos, np.sqrt(np.mean(errors_per_rho_1000, axis=0)), label = 'RMSE predictions', color='b')
+plt.plot(rhos,np.sqrt(good_error_per_rho), label='RMSE<0.001 predictions', color='g')
 plt.xlabel('rho')
-plt.ylabel('sigma from Novi keV')
+plt.ylabel('Sigma from Novi keV')
 plt.title(f'Sigma at each rho [Raw Outputs]')
 plt.legend(loc='upper right')
 plt.savefig(save_plots_dir+r"\sigmas_per_rho.png")
@@ -640,15 +666,19 @@ plt.show(block=False)
 
     
 plt.figure() # for scatter plot
-plt.axline([0, 0], [1, 1])
+plt.axline([0, 0], [-1, 1])
 for i in range(min(num_scatter,BATCH_SIZE)):
     if Normalize_Output:
         pred = unnormalize_with_moments(model.predict(images)[i], means_vars['total_output'][0],means_vars['total_output'][1])
         truth = unnormalize_with_moments(labels[i], means_vars['total_output'][0],means_vars['total_output'][1])
         error = np.mean(np.square(truth - pred))
-        plt.scatter(pred,truth,alpha=0.3)
+        plt.scatter(-pred,truth,alpha=0.3)
     else:
-        plt.scatter(model.predict(images)[i],labels[i],alpha=0.3)
+        plt.scatter(-model.predict(images)[i],labels[i],alpha=0.3)
+locs, xlabels = plt.xticks()
+for i in range(len(xlabels)):
+    xlabels[i].set_text(str(-1*float(xlabels[i].get_text().replace("−", "-"))))
+plt.xticks(locs,xlabels)
 plt.xlabel('Predicted keV')
 plt.ylabel('True keV')
 plt.suptitle(f'Scatter with Overall Loss: MSE (keV) {errors_1000.mean():.4f}')
@@ -657,6 +687,19 @@ plt.savefig(save_plots_dir+r"\scatter.png")
 plt.show(block=False)
 
 
+plt.figure() 
+for i in range(min(num_scatter,BATCH_SIZE)):
+    if Normalize_Output:
+        pred = unnormalize_with_moments(model.predict(images)[i], means_vars['total_output'][0],means_vars['total_output'][1])
+        plt.plot(rhos, pred)
+    else:
+        plt.plot(rhos,model.predict(images)[i])
+plt.xlabel('rho')
+plt.ylabel('Predicted keV')
+plt.suptitle(f'Random Trial Predictions with Overall Loss: MSE (keV) {errors_1000.mean():.4f}')
+plt.tight_layout()
+plt.savefig(save_plots_dir+r"\pred_examples.png")
+plt.show(block=False)
 
 
     
