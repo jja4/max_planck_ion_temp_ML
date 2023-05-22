@@ -8,6 +8,8 @@ import io
 from PIL import Image
 import MDSplus
 import h5py
+from skimage.measure import block_reduce
+import random
 #%matplotlib inline
 
 
@@ -95,12 +97,17 @@ print('Verify all these numbers are the same. Correct errror if not.')
 print(len(num_nonzero_targets),len(good_profile_shots),len(xrays_good_profile),len(good_target_images),len(good_sigmas))
 
 
-def groupedAvg(myArray, N=10):
-    result = np.cumsum(myArray, 0)[N-1::N]/float(N)
-    result[1:] = result[1:] - result[:-1]
-    return result
+# def groupedAvg(myArray, N=10):
+#     result = np.cumsum(myArray, 0)[N-1::N]/float(N)
+#     result[1:] = result[1:] - result[:-1]
+#     return result
 
-import random
+def groupedAvg(myArray, N=10):
+    if myArray.shape[0]%10 != 0:
+        return block_reduce(myArray, block_size=(N,1,1), func=np.mean)[:-1]
+    else:
+        return block_reduce(myArray, block_size=(N,1,1), func=np.mean)
+
 
 complete_shots =[]
 incomplete_shots =[]
