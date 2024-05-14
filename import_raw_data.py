@@ -10,7 +10,6 @@ import MDSplus
 import h5py
 from skimage.measure import block_reduce
 import random
-#%matplotlib inline
 
 
 # %% 
@@ -32,7 +31,6 @@ print('getting started')
 MDSplus.setenv('qsw_eval_path', 'mds-data-1.ipp-hgw.mpg.de::')
 
 #gather ion temp profiles for output/true values of the network
-#ion_temp = np.empty((1,40))
 ion_temp = []
 ion_temp_time = []
 sigmas = []
@@ -42,7 +40,7 @@ read_only_shots = []
 misreads = []
 for shot in shots[:]:
     try:
-        # Open the tree for evaluated XICS data for program 20180919.040
+        # Open the tree for evaluated XICS data for program number
         # Here we used the 9 digit MDSplus program number.
         tree = MDSplus.Tree('qsw_eval', int(shot))
         openable_shots.append(shot)
@@ -64,7 +62,6 @@ for shot in shots[:]:
             ion_temp_time.append(ti_line.shape[1])
             sigmas.append(ti_sigma[:,perc_good>0.80].T)
             good_shots.append(shot)
-            #ion_temp = np.concatenate((ion_temp,ti[:,perc_good>0.80].T))
             print('YAY '+shot)
         except:
             print('misread '+shot)
@@ -95,12 +92,6 @@ xrays_good_profile = [x for x in xray_zips if os.path.basename(x)[9:-4] in good_
 
 print('Verify all these numbers are the same. Correct errror if not.')
 print(len(num_nonzero_targets),len(good_profile_shots),len(xrays_good_profile),len(good_target_images),len(good_sigmas))
-
-
-# def groupedAvg(myArray, N=10):
-#     result = np.cumsum(myArray, 0)[N-1::N]/float(N)
-#     result[1:] = result[1:] - result[:-1]
-#     return result
 
 def groupedAvg(myArray, N=10):
     if myArray.shape[0]%10 != 0:
@@ -137,7 +128,6 @@ for count, zip in enumerate(xrays_good_profile[:]):
         shot_images = []
         if good_shot_time_nums[count]*10 == numimages_thisshot:
             matching100Hz_shots.append(zip[-13:-4])
-            # print('GOOD ' + zip[-13:-4])
             
             for timestep in tifs[:int(num_nonzero_targets[count]*10)]:
                 imgdata = archive.read(timestep)
@@ -208,17 +198,4 @@ for count, zip in enumerate(xrays_good_profile[:]):
 file.close()
 print('We have '+str(len(matching100Hz_shots))+' 100Hz shots with matching ion profiles and xray images')
 
-
 print('all done')
-
-# %% Extras
-# #plot ion temperatures with mask
-# for i in [0,25,50,75]:
-#     st = i
-#     en = i+25
-#     plt.figure()
-#     plt.plot(ti_mask[:,st:en]*ti[:,st:en])
-#     plt.title('Seconds '+ str(st)+ ' to '+ str(en))
-#     plt.show()
-
-
