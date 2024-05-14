@@ -1,4 +1,54 @@
-## README: XICS Image Classification for Ion Temperature Prediction
+## README 
+## A machine learning pipeline for predicting ion temperature profiles in W7-X stellarator discharges using X-ray images.
+
+---
+## Ion Temperature Data Processing for X-Ray Image Classification (import_raw_data.py)
+
+This code prepares an HDF5 dataset containing X-ray images and corresponding ion temperature profiles for training a machine learning model. 
+
+**Data Source:**
+
+* X-ray image archives located at `\\x-drive\Diagnostic-logbooks\QSW-xRayImaging\w7x_ar16`.
+* Ion temperature data retrieved from the MDSplus server using `qsw_eval` program number.
+
+**Process:**
+
+1. **Gather Data Names:**
+    * Identifies all eligible data shots from zip files within the specified directory.
+    * Extracts shot numbers and file paths for X-ray images.
+2. **Connect to MDSplus:**
+    * Sets the environment variable for the MDSplus server connection.
+3. **Process Shots:**
+    * Iterates through identified shots.
+    * Attempts to connect to the MDSplus tree for each shot and retrieve ion temperature data, masks, sigmas, and time information.
+    * Filters shots based on data quality (percentage of valid data points in the mask).
+    * Classifies shots as successfully read, misread, not accessible (read-only), or containing errors.
+4. **Prepare Dataset:**
+    * Groups usable X-ray image sets with corresponding ion temperature profiles and sigmas based on shot number.
+    * Defines a function `groupedAvg` to perform block-wise averaging on the image data (configurable block size).
+    * Creates an HDF5 file and stores training, validation, and test sets:
+        * X-ray images (after averaging) are stored in `train_input_image`, `valid_input_image`, and `test_input_image` datasets.
+        * Ion temperature profiles are stored in `train_target_image`, `valid_target_image`, and `test_target_image` datasets.
+        * Ion temperature sigmas are stored in `train_target_sigma`, `valid_target_sigma`, and `test_target_sigma` datasets.
+    * Randomly assigns data points to training, validation, and test sets with a probability distribution of 80% training, 10% validation, and 10% test.
+    * Performs basic data shape validation.
+5. **Report and Save:**
+    * Prints informative messages about the number of processed shots, successful data retrievals, data filtering results, and the number of data points in each set of the HDF5 file.
+    * Saves the HDF5 dataset to the specified directory (`C:\Users\joaf\Documents\Ion_Temp_Dataset_adj.h5`).
+
+**Outputs:**
+
+* An HDF5 file containing pre-processed X-ray images, ion temperature profiles, and sigmas split into training, validation, and test sets.
+
+**Notes:**
+
+* The code handles potential errors during data access and filtering.
+* It identifies shots with mismatched time resolution between X-ray images and ion temperature data (not 100 Hz).
+* Modify the script variables like `rootdir` and `savedir` to point to your data and desired output locations.
+
+---
+
+## XICS Image Classification for Ion Temperature Prediction (ion_temp_cnn.py)
 
 This code trains a Convolutional Neural Network (CNN) to predict ion temperature profiles from X-ray images collected during plasma discharges in the W7-X stellarator.
 The ground truth ion temperature profiles are generated with the Levenberg-Marquadt Minimization method by Novimir Pablant. 
