@@ -10,7 +10,6 @@ from tensorflow.keras.layers import Input, Conv2D , Dropout, MaxPool2D, \
 from tensorflow.keras import Model
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.regularizers import l2 , L1L2
-
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 import os
 import matplotlib.pyplot as plt
@@ -21,36 +20,28 @@ import random
 import numpy as np
 import seaborn as sns
 import gc
-
 import w7xarchive
+
 # %% 
 """Print Versions and GPU Devices"""
 physical_devices = tf.config.list_physical_devices()
 print("DEVICES : \n", physical_devices)
-
 print('Using:')
 print('\t\u2022 Python version:',sys.version)
 print('\t\u2022 TensorFlow version:', tf.__version__)
 print('\t\u2022 tf.keras version:', tf.keras.__version__)
 print('\t\u2022 Running on GPU' if len(tf.config.list_physical_devices('GPU'))>0 else '\t\u2022 GPU device not found. Running on CPU')
 
-
-
 random.seed(123)
 #%% 
-"""Hyperparameters"""
+"""
+Hyperparameters ##############################
+"""
 GPU=True
+
+"""model parameters"""
 Transformer_On = False
 Sequential_Model = True
-Collect_New_Data = False
-BATCH_SIZE = 100 # try 20, 50, 100, 64 seems to be max for GPU
-num_epochs = 100
-num_patience = int(num_epochs*0.75)
-steps = 20
-val_steps = 10
-Normalize_Output = False
-Normalize_Input_Global = False
-learning_rate = 0.001 #decent results with 0.0001
 regularizer_pen = 0.0001
 dropout_rate = 0.5
 activ_fun = 'gelu' #leaky_relu
@@ -60,12 +51,27 @@ kernel_size = (3,3) #3 originally
 stride = 1# (1,50) #(1,50) 
 pool_size = (2,2) #originally 2
 pool_stride = None #(1,50) #originally 2
-lr_patience = 2
-wavelength_start =105 # full image = 0
-wavelength_end =185 # full image = 195
-line_of_sight_start = 200 # full image = 0
-line_of_sight_end = 1475 # full image = 1475
 
+"""training parameters"""
+BATCH_SIZE = 100 # try 20, 50, 100, 64 seems to be max for GPU
+num_epochs = 100
+num_patience = int(num_epochs*0.75)
+learning_rate = 0.001 #decent results with 0.0001
+steps = 20
+val_steps = 10
+lr_patience = 2
+k_division = 6 # how many fold to divide dataset, and use most recent one
+
+"""loss function parameters"""
+huber_delta = 0.2
+loss_fn = tf.keras.losses.Huber(delta = huber_delta)
+cosine_importance = 1
+
+"""preprocessing parameters"""
+Normalize_Output = False
+Normalize_Input_Global = False
+intensity_threshold = 0.5e5 # try with lower threshold 0.1e5
+intensity_max = 0.3e6
 #crop input image
 Extra_Crop = True
 if Extra_Crop:
@@ -73,35 +79,33 @@ if Extra_Crop:
     wavelength_end =180
     line_of_sight_start = 300
     line_of_sight_end = 875
-
-k_division = 6 # how many fold to divide dataset, and use most recent one
-huber_delta = 0.2
-loss_fn = tf.keras.losses.Huber(delta = huber_delta)
-cosine_importance = 1
-Augment = True
-intensity_threshold = 0.5e5 # try with lower threshold 0.1e5
-intensity_max = 0.3e6
-if Extra_Crop:
     intensity_threshold = int(intensity_threshold/4) # try with lower threshold 0.1e5
     intensity_max = int(intensity_max/4)
 out_label_threshold = 2.5 # switch to 3.5, how many above 2.5 in %?
 out_sigma_threshold =  0.5
+
+wavelength_start =105 # full image = 0
+wavelength_end =185 # full image = 195
+line_of_sight_start = 200 # full image = 0
+line_of_sight_end = 1475 # full image = 1475
+
+"""augmentation parameters"""
+Augment = True
 height_factor = 4 # num of pixels
 width_factor = 8 # num of pixels
 rotation_factor = 4/360 # degrees of circle
-
-load_pretrained = True 
-saved_model = 'C:\\Users\\joaf\\Documents\\models\\trained_model_extra_crop_fine_tuned_twice.h5'
-hdf5_path = r'C:\Users\joaf\Documents\Ion_Temp_Dataset.h5'
 high_temp_sample_weight = 4 # 1/10 profiles have > 2 keV
-Ensemble_Models = False
 
-Test_Only = True
+"""ensemble parameters"""
+Ensemble_Models = False
 Ensemble_Simple_Average = False
 Locally_Connected = False
 Inverse_Selection_of_Dataset = False
-Plot_Metrics = True
 Freeze_Ensemble_Models = True
+
+Plot_Metrics = True
+Test_Only = True
+Collect_New_Data = False
 
 if GPU:
     physical_devices = tf.config.list_physical_devices('GPU')
@@ -113,19 +117,23 @@ else:
     os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 
 #%%  
-"""Where to save trained model and plots"""
+"""Where to load data and save trained model, plots"""
+load_pretrained = True 
+saved_model = 'C:\\Users\\joaf\\Documents\\models\\trained_model_extra_crop_fine_tuned_twice.h5'
+hdf5_path = r'C:\Users\joaf\Documents\Ion_Temp_Dataset.h5'
+
 base_dir = r"C:\Users\joaf\Documents\models"
 MODEL_FNAME = base_dir+r"\trained_model_extra_crop_fine_tuned_twice_lower_intensity_threshold.h5"
 save_plots_dir = r"C:\Users\joaf\Documents\results"
 
 
-
-""" Prepare Input Data"""
+"""EDA ####################################"""
+# used for normalizing data
 def extract_mean_var(x, axes=0): # originally axes=[0,1]
     mean, variance = tf.nn.moments(x, axes=axes)
     return mean, variance
     
-
+"""extract mean and variance of ion temp profiles to be plotted later"""
 with h5py.File(hdf5_path, "r") as f:
     # Print all root level object names (aka keys) 
     print("Keys: %s" % f.keys())
@@ -167,6 +175,7 @@ with h5py.File(hdf5_path, "r") as f:
     max_train = f[train_output_key][max_train_idx[0]]
     med_train = np.median(f[train_output_key][:],axis=0)
 
+"""plot an outlier datapoint and a "normal" datapoint"""
 with h5py.File(hdf5_path, "r") as f: 
     below_plotted = False
     above_plotted = False
@@ -228,7 +237,7 @@ def unnormalize_with_moments(x, mean, variance, epsilon=1e-8):
     x_unnormed = x * tf.sqrt(variance + epsilon) + mean  # epsilon to avoid dividing by zero
     return x_unnormed
 
-
+"""calculate mean and variance of whole dataset"""
 mean_total = (num_train_imgs*mean_train + num_valid_imgs*mean_valid + num_test_imgs*mean_test)/(num_train_imgs + num_valid_imgs + num_test_imgs)
 var_total = (num_train_imgs*var_train + num_valid_imgs*var_valid + num_test_imgs*var_test)/(num_train_imgs + num_valid_imgs + num_test_imgs)
 means_vars = {train_output_key:[mean_train, var_train],valid_output_key:[mean_valid, var_valid],test_output_key:[mean_test, var_test],\
@@ -236,6 +245,7 @@ means_vars = {train_output_key:[mean_train, var_train],valid_output_key:[mean_va
 
 
 # %%     
+""" Prepare Input Data ####################################"""
 """Create generator to pull data from HDF5 file"""
 class generator:
     def __init__(self, file, input_key, output_key, output_sigma_key):
@@ -248,6 +258,7 @@ class generator:
         #makes interesting learning curves when taken in order instead of randomly
         with h5py.File(self.file, 'r') as hf:
             while True:
+                """randomly sample data from specified dataset"""
                 if 'train' in self.input_key:
                     start_good_trials = int(num_train_imgs/k_division)
                 elif 'valid' in self.input_key:
@@ -267,6 +278,7 @@ class generator:
                 out_im_max = np.max(out_im)
                 out_sigma_max = np.max(out_sigma)
                 
+                """weight the samples, rarer samples get higher weighting"""
                 if out_im_max>2.25 or out_im_max<1.52:
                     sample_weight = high_temp_sample_weight
                 else:
@@ -278,11 +290,11 @@ class generator:
                     if intensity<intensity_threshold or out_im_max>out_label_threshold or out_sigma_max>out_sigma_threshold: 
                         yield in_im, (out_im, out_sigma), sample_weight
                 else:
+                    """filter out outliers"""
                     if intensity_max>intensity>intensity_threshold and out_im_max<out_label_threshold and out_sigma_max<out_sigma_threshold: ### keeps 75% of images
                         yield in_im, (out_im, out_sigma), sample_weight
-
+"""size of input images"""
 image_shape = (tf.TensorShape([wavelength_end-wavelength_start,line_of_sight_end-line_of_sight_start,1]))
-
 
 train_dataset = tf.data.Dataset.from_generator(
     generator(hdf5_path,train_input_key,train_output_key,train_output_sigma_key), 
@@ -438,22 +450,21 @@ if not Test_Only:
                     weighted_metrics=[],
                     sample_weight_mode=[None])
 
-#if validation accuracy doesnt improve for 15 epoch, stop training
+"""if validation accuracy doesnt improve for 15 epoch, stop training"""
 early_stopping = EarlyStopping(monitor='val_loss', patience=num_patience,restore_best_weights=True)
     
-#save the model if a better validation accuracy then previous better accuracy is obtained  
+"""save model when validation loss declines"""
 metric = 'val_loss'
 checkpointer = ModelCheckpoint(filepath=MODEL_FNAME, verbose=2, monitor=metric, mode='min', save_best_only=True)
 reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5,\
                             patience=lr_patience, min_lr=0.000001)
-# write accuracy and loss history to the log.csv
 
+"""write accuracy and loss history to the log.csv"""
 log_dir = base_dir+r'\ilogs\default'
-
 tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=log_dir) # in terminal run: tensorboard --logdir=C:\Users\joaf\Documents\models\ilogs\ --port=6006
-
 csv_logger = CSVLogger(base_dir+r'\log.csv', append=True, separator=' ')
 
+"""monitor which epoch is best"""
 class BestEpochCallback(tf.keras.callbacks.Callback):
     def __init__(self):
         super(BestEpochCallback, self).__init__()
@@ -474,7 +485,6 @@ class ClearMemory(tf.keras.callbacks.Callback):
 # %% 
 """ Train """
 fully_trained = False
-
 if not Test_Only:
     history=model.fit(train_dataset,
         validation_data = valid_dataset,
@@ -486,9 +496,9 @@ if not Test_Only:
     fully_trained = True
 
 # %% 
-""" Plot the train and validation Loss """
+"""Evaluate on Test Data and Plot Results ##################################"""
 if Plot_Metrics:
-
+    """ Plot the train and validation Loss """
     if not Test_Only:
         if not fully_trained:
             history = model.history
@@ -535,7 +545,7 @@ if Plot_Metrics:
     num_scatter = 40
     rhos = np.linspace(0,1,output_arr.shape[1])
 
-    #plots per prediction
+    """Plots of random predictions vs true values"""
     if Normalize_Output:
         ppp = 3
         p = 1
@@ -579,19 +589,21 @@ if Plot_Metrics:
     fig.suptitle(f'Overall MSE: {scores:.4f}')
     fig.savefig(save_plots_dir+r"\predictions.png")
     
+    """Plot Example X-ray Input Image"""
     plt.figure(figsize= (12,8))
     plt.imshow(tf.transpose(images[0,:,:,0]))
     plt.title(f'Example X-Ray Image')
     plt.xlabel('wavelength')
     plt.ylabel('line of sight')    
 
-    # plt.figure()
-    # plt.plot(rhos, np.mean(errors_per_rho_1000, axis=0))
-    # plt.xlabel('rho')
-    # plt.ylabel('MSE keV')
-    # plt.title(f'Loss (MSE) at each rho [Raw Outputs]')
-    # plt.savefig(save_plots_dir+r"\loss_per_rho.png")
-    # plt.show(block=False)
+    """Plot Loss per rho (plasma radius)"""
+    plt.figure()
+    plt.plot(rhos, np.mean(errors_per_rho_1000, axis=0))
+    plt.xlabel('rho')
+    plt.ylabel('MSE keV')
+    plt.title(f'Loss (MSE) at each rho [Raw Outputs]')
+    plt.savefig(save_plots_dir+r"\loss_per_rho.png")
+    plt.show(block=False)
 
     batches2take = 10
     intenstities_all = np.zeros(BATCH_SIZE*batches2take)
@@ -608,9 +620,7 @@ if Plot_Metrics:
         intenstities_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE)] = intenstities
         sigmas_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = sigmas
         sample_weights_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE)] = sample_weights
-        
-        
-        
+    
         if Normalize_Output:
             pred = unnormalize_with_moments(model.predict(images), means_vars['total_output'][0],means_vars['total_output'][1])
             pred_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE),:] = pred
@@ -626,6 +636,7 @@ if Plot_Metrics:
             errors_all[int(i*BATCH_SIZE):int((i+1)*BATCH_SIZE)] = error
         i += 1 
 
+    """Plot poor performing prediction"""
     plt.figure()
     plt.plot(rhos,labels_all[np.argmax(errors_all)], color = 'orange')
     if not Normalize_Output:
@@ -640,6 +651,7 @@ if Plot_Metrics:
     good_error_per_rho = np.mean(errors_per_rho_1000[good_error_idx,:], axis=0)
 
 
+    """Plot joint histogram of Intensity (brightness) vs Loss """
     h = sns.jointplot(x=intenstities_all[:], y=errors_all[:],ratio=5,kind='hist') #,marginal_kws=dict(bins=20)
     h.plot_marginals(sns.rugplot, color="r", height=-.1, clip_on=False)
     h.set_axis_labels('Intensity', 'MSE keV', fontsize=16)
@@ -648,6 +660,7 @@ if Plot_Metrics:
     plt.savefig(save_plots_dir+r"\loss_vs_intensity.png")
     plt.show(block=False)
 
+    """Plot joint histogram of Max Temp vs Loss """
     h = sns.jointplot(x=np.max(labels_all,axis=1), y=errors_all[:],ratio=5,kind='hist') #,marginal_kws=dict(bins=20)
     h.plot_marginals(sns.rugplot, color="r", height=-.1, clip_on=False)
     h.set_axis_labels('Max Temp keV', 'MSE keV', fontsize=16)
@@ -656,7 +669,7 @@ if Plot_Metrics:
     plt.savefig(save_plots_dir+r"\loss_vs_temp.png")
     plt.show(block=False)
         
-    # find experiment number for corresponding bad profiles   
+    """Plot random predictions to see how frequently bad predictions occur"""  
     num_bad=6    
     with h5py.File(hdf5_path, "r") as f:
         test_output_key = list(f.keys())[4]
@@ -681,7 +694,7 @@ if Plot_Metrics:
         max_sigmas = f[test_output_sigma_key][np.sort(sorted_max_idx[-num_bad:-1])]
         mean_sigmas = np.mean(f[test_output_sigma_key][:], axis=0)
 
-
+    """Plot Mean, Median, Min, and Max Temp Profiles"""
     plt.figure()
     plt.plot(rhos,mean_train, label = 'mean')
     plt.plot(rhos,med_train, label = 'median')
@@ -696,7 +709,7 @@ if Plot_Metrics:
     plt.savefig(save_plots_dir+r"\ion_profile_metrics_plot.png")
     plt.show(block=False)
 
-
+    """Plot Error per rho of predictions and Physics Model Error"""
     plt.figure()
     plt.plot(rhos, mean_sigmas, label= 'Sigma', color='orange')
     plt.plot(rhos, np.sqrt(np.mean(errors_per_rho_1000, axis=0)), label = 'RMSE predictions', color='b')
@@ -708,8 +721,8 @@ if Plot_Metrics:
     plt.savefig(save_plots_dir+r"\sigmas_per_rho.png")
     plt.show(block=False)
 
-        
-    plt.figure() # for scatter plot
+    """Plot Scatter plot of Predicted vs True"""    
+    plt.figure() 
     plt.axline([0, 0], [-1, 1])
     for i in range(min(num_scatter,BATCH_SIZE)):
         if Normalize_Output:
@@ -730,7 +743,7 @@ if Plot_Metrics:
     plt.savefig(save_plots_dir+r"\scatter.png")
     plt.show(block=False)
 
-
+    """Plot Random Predictions as Lines"""
     plt.figure() 
     for i in range(min(num_scatter,BATCH_SIZE)):
         if Normalize_Output:
@@ -752,7 +765,7 @@ print("End of Training")
 
 
 # %% 
-"""Test model on new data"""
+"""Test model on newly acquired data (not in Test Dataset)"""
 signal_name = "ArchiveDB/raw/W7X/ControlStation.71501/DETECTOR0-1_DATASTREAM/0/frames"
 shotnum = '20221109.15'
 time_intervals = w7xarchive.get_time_intervals_for_program(signal_name, shotnum)
@@ -769,7 +782,7 @@ def moving_average(a, n=10) :
     return ret[n - 1:] / n
 def moving_starts(a,n=10):
     return a[n-1:]
-
+"""Source new X-ray data"""
 if Collect_New_Data:
     all_new_images =[]
     times = []
@@ -781,6 +794,7 @@ if Collect_New_Data:
         t, d = w7xarchive.get_image_json("ArchiveDB/raw/W7X/ControlStation.71501/DETECTOR0-1_DATASTREAM/0/frames", from_time, to_time)
         times.append(t)
 
+        """Apply the same preprocessing to the new data"""
         if len(d.shape)>2:
             shot_avgs = moving_average(d)
             start_ts =moving_starts(t)
@@ -799,10 +813,12 @@ if Collect_New_Data:
     new_exp_data = np.concatenate(all_new_images)
     np.save(r'C:\Users\joaf\Documents\New_XICS_Image_times_091122_cropped.npy',new_good_times)
     np.save(r'C:\Users\joaf\Documents\New_XICS_Images_091122_cropped.npy',new_exp_data)
+"""Load new data already preprocessed instead of sourcing it"""
 if not Collect_New_Data:
     new_exp_data = np.load(r'C:\Users\joaf\Documents\New_XICS_Images_091122.npy')
     new_good_times = np.load(r'C:\Users\joaf\Documents\New_XICS_Image_times_091122.npy')
 #%% New Ti Profiles
+"""Source new corresponding ion temp data and Fast Physics Model Predictions"""
 ti_signal_name = "ArchiveDB/raw/Minerva/Minerva.IonTemperature.XICS/Ti_lineIntegrated_DATASTREAM/V1/0/signalTi/"
 time_from, time_to = time_intervals[-1,0], time_intervals[0,1]
 time, val = w7xarchive.get_signal(ti_signal_name, time_from, time_to)
@@ -817,7 +833,7 @@ def find_nearest(array, value):
     idx = (np.abs(array - value)).argmin()
     return array[idx], value
 #%% Plots
-
+"""Plot New CNN Predictions vs Fast Physics Model Predictions"""
 model = tf.keras.models.load_model(MODEL_FNAME)
 num_plots = 4
 fig, axs = plt.subplots(figsize= (10,16*ppp),nrows=num_plots, ncols = 2, gridspec_kw={'width_ratios': [1, 5]}, tight_layout =True)
